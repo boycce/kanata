@@ -77,34 +77,35 @@ impl KbdIn {
             ));
         }
 
+        let has_explicit_filters = include_names.is_some() || exclude_names.is_some();
+
         // Based on the definition of include and exclude names, they should never be used together.
         // Kanata config parser should probably enforce this.
-        let device_names = if let Some(included_names) = include_names {
-            validate_and_register_devices(included_names)
-        } else if let Some(excluded_names) = exclude_names {
-            // get all devices
-            let kb_list = fetch_devices();
+        let mut device_names = resolve_and_register_devices(
+            include_names.as_deref(),
+            exclude_names.as_deref(),
+            true,
+        );
 
-            // filter out excluded devices
-            let devices_to_include = kb_list
-                .iter()
-                .filter(|k| !excluded_names.iter().any(|n| *k == n.as_str()))
-                .map(|k| {
-                    if k.product_key.trim().is_empty() {
-                        format!("{:x}", k.hash)
-                    } else {
-                        k.product_key.clone()
-                    }
-                })
-                .collect::<Vec<String>>();
+        if has_explicit_filters && device_names.is_empty() {
+            log::warn!(
+                "No keyboard devices currently match macos-dev-names include/exclude filters. Waiting for a matching device..."
+            );
+            loop {
+                std::thread::sleep(Duration::from_millis(1000));
+                device_names = resolve_and_register_devices(
+                    include_names.as_deref(),
+                    exclude_names.as_deref(),
+                    false,
+                );
+                if !device_names.is_empty() {
+                    log::info!("Found matching keyboard device(s): {device_names:?}");
+                    break;
+                }
+            }
+        }
 
-            // register the remeining devices
-            validate_and_register_devices(devices_to_include)
-        } else {
-            vec![]
-        };
-
-        if !device_names.is_empty() || register_device("") {
+        if !device_names.is_empty() || (!has_explicit_filters && register_device("")) {
             if grab() {
                 Ok(Self { grabbed: true })
             } else {
@@ -163,7 +164,38 @@ impl KbdIn {
     }
 }
 
-fn validate_and_register_devices(include_names: Vec<String>) -> Vec<String> {
+fn resolve_and_register_devices(
+    include_names: Option<&[String]>,
+    exclude_names: Option<&[String]>,
+    warn_on_missing: bool,
+) -> Vec<String> {
+    if let Some(included_names) = include_names {
+        validate_and_register_devices(included_names.to_vec(), warn_on_missing)
+    } else if let Some(excluded_names) = exclude_names {
+        // get all devices
+        let kb_list = fetch_devices();
+
+        // filter out excluded devices
+        let devices_to_include = kb_list
+            .iter()
+            .filter(|k| !excluded_names.iter().any(|n| *k == n.as_str()))
+            .map(|k| {
+                if k.product_key.trim().is_empty() {
+                    format!("{:x}", k.hash)
+                } else {
+                    k.product_key.clone()
+                }
+            })
+            .collect::<Vec<String>>();
+
+        // register the remaining devices
+        validate_and_register_devices(devices_to_include, warn_on_missing)
+    } else {
+        vec![]
+    }
+}
+
+fn validate_and_register_devices(include_names: Vec<String>, warn_on_missing: bool) -> Vec<String> {
     include_names
         .iter()
         .filter_map(|dev| {
@@ -182,7 +214,9 @@ fn validate_and_register_devices(include_names: Vec<String>) -> Vec<String> {
             match device_matches(dev) {
                 true => Some(dev.to_string()),
                 false => {
-                    log::warn!("'{dev}' doesn't match any connected device");
+                    if warn_on_missing {
+                        log::warn!("'{dev}' doesn't match any connected device");
+                    }
                     None
                 }
             }
@@ -191,7 +225,17 @@ fn validate_and_register_devices(include_names: Vec<String>) -> Vec<String> {
             if register_device(&dev) {
                 Some(dev.to_string())
             } else {
-                log::warn!("Couldn't register device '{}' - device may be in use by another application or disconnected", dev);
+                if warn_on_missing {
+                    log::warn!(
+                        "Couldn't register device '{}' - device may be in use by another application or disconnected",
+                        dev
+                    );
+                } else {
+                    log::debug!(
+                        "Couldn't register device '{}' while waiting for matching device",
+                        dev
+                    );
+                }
                 None
             }
         })
